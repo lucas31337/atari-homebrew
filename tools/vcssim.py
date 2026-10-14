@@ -1,17 +1,30 @@
 """Tiny Atari 2600 frame-timing simulator (CPU + WSYNC + RIOT timer only).
 
 Counts scanlines per frame from VSYNC to VSYNC and reports anything that is
-not 262, plus the first playfield write per frame.  Needs the py65 package:
+not 262.  Needs the py65 package:
     python -m venv .venv && .venv\\Scripts\\pip install py65
-Usage: python tools/vcssim.py bin/rainstorm.a26 [frames] [fire_from_frame] [fire_frames]
+Usage: python tools/vcssim.py rom.a26 FRAMES [INPUT ...]
+  INPUT tokens: "<frame>:<keys>" or "<from>-<to>:<keys>", keys from F (fire), L, R
+  e.g. python tools/vcssim.py bin/rainstorm.a26 900 3:F 700-760:L 770:F
+Prints the game variables (RAM $80..) at the end.
 """
 import sys
 from py65.devices.mpu6502 import MPU
 
 rom = open(sys.argv[1], 'rb').read()
 FRAMES = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-FIRE_AT = int(sys.argv[3]) if len(sys.argv) > 3 else -1
-FIRE_LEN = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+events = []   # (first, last, keys)
+for tok in sys.argv[3:]:
+    span, keys = tok.split(':')
+    a, b = (span.split('-') + [None])[:2]
+    events.append((int(a), int(b) if b else int(a) + 1, keys.upper()))
+
+
+def keys_at(frame):
+    k = ''
+    for a, b, keys in events:
+        if a <= frame <= b: k += keys
+    return k
 
 
 class Mem:
@@ -21,7 +34,6 @@ class Mem:
         s.vsync_on = False; s.frame_start = 0; s.frames = []; s.frame = 0
 
     def cyc(s): return s.cpu.processorCycles
-    def line(s): return (s.cyc() - s.frame_start) // 76
     def __len__(s): return 0x10000
 
     def __getitem__(s, a):
@@ -36,10 +48,15 @@ class Mem:
                     t = el // s.timer_int
                     if t <= s.timer_val: return s.timer_val - t
                     return (-(el - (s.timer_val + 1) * s.timer_int) - 1) & 0xFF
+                if r == 0:   # SWCHA: bit 7 right, bit 6 left (0 = pushed)
+                    k = keys_at(s.frame); v = 0xFF
+                    if 'R' in k: v &= 0x7F
+                    if 'L' in k: v &= 0xBF
+                    return v
                 return 0xFF  # SWCHB etc: nothing pressed
             return s.ram[a & 0x7F]
         if (a & 0x0F) == 0x0C:  # INPT4
-            return 0x00 if (FIRE_AT >= 0 and FIRE_AT <= s.frame < FIRE_AT + FIRE_LEN) else 0x80
+            return 0x00 if 'F' in keys_at(s.frame) else 0x80
         return 0
 
     def __setitem__(s, a, v):
@@ -73,4 +90,4 @@ while m.frame <= FRAMES:
 bad = [(i, n) for i, n in enumerate(m.frames) if i > 0 and n != 262]
 print(f'{len(m.frames)} frames; first frame {m.frames[0]:.0f} lines (power-on)')
 print('non-262 frames:', bad[:20] if bad else 'none')
-print('RAM $80-$9F:', ' '.join(f'{b:02X}' for b in m.ram[0:32]))
+print('RAM $80-$BF:', ' '.join(f'{b:02X}' for b in m.ram[0:64]))
