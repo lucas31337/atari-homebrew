@@ -15,3 +15,13 @@ The Main Game scene starts just after the intro, with stormy clouds and grass, a
 the minimum players:1
 
 When all the trees are gone you will have a seed. To plant the seed press the fire button.
+
+### Rules (as implemented)
+
+- **Lightning target.** Heights are counted in blocks: a tree counts its trunk blocks (the canopy does not count), a wood pile counts its logs, the tower counts its blocks, and the player counts 2 (3 from 6 lines up in a jump, 4 at the top). The tallest object is struck. Ties go to the tower first, then the leftmost tree, then the leftmost pile; the player loses every tie. So on level 1 (trees of 4) the tower is hit as soon as it reaches 4 blocks, and once the trees are gone the piles start burning unless a new tree is planted to draw the lightning.
+- **Struck tree** becomes a pile of that many wood blocks at its base (a pile holds at most 8). **Struck tower** loses 2 blocks. **Struck pile** loses 2 logs.
+- **Strike interval** by level (frames): 240, 210, 180, 150, 120, 90, 90, 90.
+- **Player.** Joystick left/right walks. Joystick up jumps 2 blocks high (about 20 frames in the air; you can keep walking, and holding up bounces). FIRE with empty hands picks up a block from a pile within reach; FIRE while holding a block at the right edge (the tower zone) stacks it on the tower.
+- **Seed.** When no trees are standing and the player's hands are empty, the player holds a seed. FIRE plants it in the nearest empty slot; the new tree gets a random height (2-4; 4 on level 1).
+- **Levels.** The goal is a tower of 4 + level blocks (max 8). Reaching it starts the next level: new trees, empty tower and piles, faster lightning. The status line shows level, tower height and goal.
+- **Game over.** When the player is the tallest object, the bolt hits them. Standing behind or beside a tree, pile or tower that gets struck is safe: it takes the hit for you. Watch out when little is left standing, and do not jump near a strike (a jump makes you up to 4 blocks tall). The scene freezes with the bolt for 1.5 seconds, then a GAME OVER screen appears; FIRE returns to the title.

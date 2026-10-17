@@ -6,7 +6,8 @@
 #   TOWER_REG/BYTE  the wood tower at the right edge
 #   DigitL/DigitR   3x5 digits, 5 bytes each, for PF1 (bits 2..0, left = bit 2) and PF2 (reversed)
 #   BoltGfx         sky-band lightning sprite; BoltBand: tree-band continuation
-#   Player*         6 player sprites (stand/walk x none/block/seed), 18 rows each
+#   Player*         6 player sprites (stand/walk x none/block/seed), 18 rows each + 12 zero rows
+#                   after each (the player is drawn up to JUMP_MAX=12 lines higher while jumping)
 param([string]$Out = "src\rainstorm_gfx.inc")
 $ErrorActionPreference = 'Stop'
 
@@ -136,9 +137,10 @@ $items = @{
 }
 $stand = @('..XXX...', '..XXX...', '...X....', '.XXXXX..', 'X.XXX.X.', '..XXX...', '..XXX...', '..X.X...', '..X.X...', '..X.X...', '.XX.XX..', '........')
 $walk  = @('..XXX...', '..XXX...', '...X....', '.XXXXX..', 'X.XXX.X.', '..XXX...', '..XXX...', '.X...X..', '.X...X..', 'XX...XX.', '........', '........')
+$pad = @(0) * 12   # blank rows below each sprite: the band reads up to 12 rows past it when jumping
 foreach ($item in 'None', 'Block', 'Seed') {
-    Emit "PlayerStand$item" (($items[$item] + $stand) | ForEach-Object { Sprite $_ })
-    Emit "PlayerWalk$item"  (($items[$item] + $walk)  | ForEach-Object { Sprite $_ })
+    Emit "PlayerStand$item" ((($items[$item] + $stand) | ForEach-Object { Sprite $_ }) + $pad)
+    Emit "PlayerWalk$item"  ((($items[$item] + $walk)  | ForEach-Object { Sprite $_ }) + $pad)
 }
 
 Set-Content -Path $Out -Value $script:files.main -Encoding ascii

@@ -11,13 +11,15 @@ Current game: **RAINSTORM** (`src/rainstorm.asm`, spec in `docs/GAMEPLAY.md`).
 ## Build & run
 ```powershell
 .\build.ps1 rainstorm -Run      # src\rainstorm.asm -> bin\rainstorm.a26, opens in Stella
+run.bat [name]                 # same thing, double-clickable (default: rainstorm)
 .\tools\pftext.ps1 src\rainstorm_text.inc Title:RAINSTORM By:BY "Author:LUCAS YOUNG" Start:START   # title text tables
+.\tools\pftext.ps1 src\rainstorm_over.inc "Over:GAME OVER"   # game-over text table
 .\tools\gfx.ps1                 # clouds / rain / tree patterns / digits / bolt / player -> src\rainstorm_*.inc
 ```
 Test builds: `dasm src\rainstorm.asm -f3 -Iinclude -Isrc -DAUTOSTART=1 -DBOLT_FRAMES=120 -obin\test.a26`
 (skips the title screen, holds the lightning bolt on screen).
 
-Stella: `` ` `` debugger · `Ctrl+R` reload ROM · `Tab` options · arrows + `Space` = joystick + fire · `F2` console Reset · `Esc` quits (no launcher).
+Stella: `` ` `` debugger · `Ctrl+R` reload ROM · `Tab` options · arrows + `Space` = joystick (up = jump) + fire · `F2` console Reset · `Esc` quits (no launcher).
 Frame stats overlay: run with `-plr.stats 1`; a good NTSC ROM shows 261/262 lines / 60 Hz.
 
 `tools/vcssim.py` (needs `pip install py65`) runs a ROM headless with scripted joystick input and reports any frame
@@ -27,14 +29,19 @@ that is not 262 lines plus the game variables, e.g.
 ## Layout
 `src/` game sources · `include/` headers · `tools/` generators + simulator · `docs/` design · `bin/` build output (ignored)
 
+ROM is full: the main code region ends at the `$FA00` text page. `PickTarget` lives after the graphics tables, the GAME OVER
+screen in the bolt page, and a few small tables in the player-sprite page. Check `ROM bytes free` and the listing when adding code.
+
 ## Flashback 12 Gold
 Copy the `.a26` file to a USB storage device and plug it into the console. Stick to 2K/4K/standard bank-switched ROMs for compatibility.
 
 ## How RAINSTORM works
-- Title → intro (clouds roll in, grey, cloud lightning, rain, two ground strikes) → main game.
+- Title → intro (clouds roll in, grey, cloud lightning, rain, two ground strikes) → main game → GAME OVER (player struck:
+  scene freezes with the bolt, then a text screen; FIRE → title).
 - Main game: 3 tree slots, trees of 2-4 blocks + 2-row canopy (level 1: all 4). Lightning (interval shrinks per level) hits the
-  tallest object: tallest tree, or the tower if strictly taller. Struck tree → that many wood blocks piled at its base;
-  struck tower → loses 2 blocks. Player: joystick left/right; FIRE picks up a block at a pile, stacks it when at the right
+  tallest object counted in blocks: tree trunks (canopy ignored), wood piles, the tower and the player (2, up to 4 when jumping;
+  ties: tower, then leftmost tree, then leftmost pile, player last). The bolt hitting the player → game over; standing beside a struck object is safe.
+  Struck tree → that many wood blocks piled at its base; struck tower or pile → loses 2 blocks. Player: joystick left/right; FIRE picks up a block at a pile, stacks it when at the right
   edge (tower zone), or plants the seed (held automatically once all trees are gone) in the nearest empty slot.
   Tower height ≥ goal (4 + level, max 8) → next level. Status line: level · tower · goal.
 - Drawing (192 lines): 12 status (playfield digits) · 24 clouds (playfield scroll tables) · 80 sky with rain (playfield) + bolt (P1)
@@ -46,7 +53,11 @@ Copy the `.a26` file to a USB storage device and plug it into the console. Stick
 - **RIOT timer:** always read `INTIM` right before writing `TIM64T` (see `SET_TIMER`). After a timer runs out it ticks once per cycle and wraps every 256 cycles; a write landing on a wrap cycle leaves it in that mode and the next wait ends ~64x early. Symptom: frame length depends on code layout (79/248/310 lines instead of 262).
 - **DASM `.local` labels** are scoped by `SUBROUTINE`, not by the nearest global label; put `SUBROUTINE` before every routine that uses them. Branches are ±127 bytes: long routines need `jmp`. `macro.h`'s `SLEEP` crashed DASM 2.20.17 here; use explicit delay loops.
 - **Playfield pixels are 4x wider than tall**; vertical detail is cheap, horizontal detail is not. Digit rows need ≥ 2 lines to be legible.
-- **Budget:** ~2750 cycles of VBLANK and ~2240 of overscan per frame; anything heavier must be split across frames.
+- **Budget:** ~2750 cycles of VBLANK and ~2170 of overscan per frame; anything heavier must be split across frames.
+  `tools/vcssim.py` prints the busiest frame per timer.
+- **Timer phase:** a RIOT timer should run out early in a scanline. If it runs out near the end of one, whether the
+  `lda INTIM / bne` loop plus the following `sta WSYNC` still make that line depends on the cycle phase of the code
+  before it, and the frame length flips between 262 and 263 when unrelated code changes (see `Overscan`).
 - PowerShell: returning a single-element nested array from a function unrolls it — use `,$array`.
 
 ## Log
@@ -54,3 +65,4 @@ Copy the `.a26` file to a USB storage device and plug it into the console. Stick
 - 2026-10-12 — `rainstorm.asm`: title screen (RAINSTORM / BY / LUCAS YOUNG / blinking START). Playfield text generator `tools/pftext.ps1`. Found and fixed the RIOT timer gotcha above.
 - 2026-10-12 — Intro sequence and a first "lightning burns trees" scene; `tools/gfx.ps1`, `tools/vcssim.py`.
 - 2026-10-13 — Gameplay per the updated `docs/GAMEPLAY.md`: tree heights, tallest-object lightning, wood piles, walking player, tower building, seed planting, levels. Status line. ~270 ROM bytes free.
+- 2026-10-17 — `run.bat` launcher. Lightning now compares trunk blocks vs tower blocks (canopy ignored, tower wins ties) so the tower actually gets struck; wood piles are targets too and burn 2 logs per strike. Joystick UP jumps 2 blocks (player sprites zero-padded in their own page, drawn in band rows 3-7). Found and fixed the timer-phase gotcha above (overscan timer 34 ticks after a short delay). `tools/vcssim.py`: `U` key, per-timer cycle report. The player is a lightning target too (2 blocks, 4 at the jump peak, loses ties; standing beside a struck tree is safe) and being hit ends the game: frozen scene, then a GAME OVER screen (`src/rainstorm_over.inc`), FIRE → title. ROM nearly full, see Layout. Rules written up in `docs/GAMEPLAY.md`.

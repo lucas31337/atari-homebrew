@@ -4,7 +4,7 @@ Counts scanlines per frame from VSYNC to VSYNC and reports anything that is
 not 262.  Needs the py65 package:
     python -m venv .venv && .venv\\Scripts\\pip install py65
 Usage: python tools/vcssim.py rom.a26 FRAMES [INPUT ...]
-  INPUT tokens: "<frame>:<keys>" or "<from>-<to>:<keys>", keys from F (fire), L, R
+  INPUT tokens: "<frame>:<keys>" or "<from>-<to>:<keys>", keys from F (fire), L, R, U (up = jump)
   e.g. python tools/vcssim.py bin/rainstorm.a26 900 3:F 700-760:L 770:F
 Prints the game variables (RAM $80..) at the end.
 """
@@ -32,6 +32,7 @@ class Mem:
         s.ram = bytearray(128); s.cpu = None
         s.wsync = False; s.timer_set = 0; s.timer_val = 0; s.timer_int = 64
         s.vsync_on = False; s.frame_start = 0; s.frames = []; s.frame = 0
+        s.pending = False; s.segs = []   # (frame, timer ticks, cycles from TIM64T to the first INTIM read)
 
     def cyc(s): return s.cpu.processorCycles
     def __len__(s): return 0x10000
@@ -45,6 +46,7 @@ class Mem:
                 r = a & 0x7
                 if r == 4:   # INTIM (no 1-cycle wrap mode: we never rely on it)
                     el = s.cyc() - s.timer_set
+                    if s.pending: s.pending = False; s.segs.append((s.frame, s.timer_val, el))
                     t = el // s.timer_int
                     if t <= s.timer_val: return s.timer_val - t
                     return (-(el - (s.timer_val + 1) * s.timer_int) - 1) & 0xFF
@@ -52,6 +54,7 @@ class Mem:
                     k = keys_at(s.frame); v = 0xFF
                     if 'R' in k: v &= 0x7F
                     if 'L' in k: v &= 0xBF
+                    if 'U' in k: v &= 0xEF
                     return v
                 return 0xFF  # SWCHB etc: nothing pressed
             return s.ram[a & 0x7F]
@@ -65,7 +68,7 @@ class Mem:
         if a & 0x80:
             if a & 0x200:
                 if (a & 0x17) == 0x16:  # TIM64T
-                    s.timer_set = s.cyc(); s.timer_val = v; s.timer_int = 64
+                    s.timer_set = s.cyc(); s.timer_val = v; s.timer_int = 64; s.pending = True
                 return
             s.ram[a & 0x7F] = v; return
         r = a & 0x3F
@@ -90,4 +93,10 @@ while m.frame <= FRAMES:
 bad = [(i, n) for i, n in enumerate(m.frames) if i > 0 and n != 262]
 print(f'{len(m.frames)} frames; first frame {m.frames[0]:.0f} lines (power-on)')
 print('non-262 frames:', bad[:20] if bad else 'none')
+# logic cycles per timer segment: the game's code between SET_TIMER and the wait loop
+for ticks in sorted({t for _, t, _ in m.segs}):
+    worst = max((el, f) for f, t, el in m.segs if t == ticks and f > 0)
+    print(f'timer {ticks} ({ticks * 64} cycles): busiest frame {worst[1]} used {worst[0]} cycles')
+for f, _ in bad[:5]:
+    print(f'frame {f}:', ', '.join(f'timer {t}: {el}' for ff, t, el in m.segs if ff == f))
 print('RAM $80-$BF:', ' '.join(f'{b:02X}' for b in m.ram[0:64]))

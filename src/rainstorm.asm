@@ -4,20 +4,26 @@
 ;          INTRO - blue sky and field; clouds roll in, turn grey, lightning in the clouds,
 ;                  rain starts, two lightning strikes hit the ground
 ;          MAIN  - three trees of height 2-4 (level 1: all 4).  Lightning strikes the
-;                  tallest object: the tallest tree, or the player's wood tower if it is
-;                  taller than every tree.  A struck tree becomes a pile of wood blocks.
-;                  The player walks (joystick), picks up blocks and stacks them on the
-;                  tower at the right edge (FIRE).  When all trees are gone the player
+;                  tallest object, counted in blocks: the tallest tree trunk (canopy not
+;                  counted), or the player's wood tower if it is at least as tall as every
+;                  tree.  Wood piles count too, and the player (2 blocks, 4 at the top of a
+;                  jump); ties: tower, tree, pile, player last.  A struck tree becomes a pile
+;                  of wood blocks; a struck tower or pile loses 2 blocks.  A bolt that hits
+;                  the player: GAME OVER (the scene freezes, then a text screen; FIRE
+;                  returns to the title).  Standing beside a struck object is safe.
+;                  The player walks (joystick), jumps 2 blocks high (UP), picks up blocks
+;                  and stacks them on the tower at the right edge (FIRE).  When all trees are gone the player
 ;                  holds a seed; FIRE plants it in the nearest empty slot.  Tower height
 ;                  >= goal -> next level (new trees, random heights, faster lightning).
 ;                  Console RESET (F2 in Stella) returns to the title from anywhere.
 ;
 ; Frame:   3 VSYNC + 37 VBLANK + 192 visible + 30 overscan = 262 lines
+;          (RIOT timers; see Overscan for why their run-out cycle must sit early in a line)
 ; Scene kernel, top to bottom (192 lines):
 ;          8 status (level / tower / goal digits) | 24 clouds (playfield, 4 rows) |
 ;          1+79 sky with rain (playfield) and the lightning bolt (P1) |
 ;          48 tree band: 8 rows of 6 lines, playfield from RAM (trees, wood piles, tower),
-;          bolt (P1) and the player (P0, rows 5-7) | 1+31 grass
+;          bolt (P1) and the player (P0, rows 3-7: stands in 5-7, jumps 2 rows) | 1+31 grass
         processor 6502
         include "vcs.h"
         include "macro.h"
@@ -25,6 +31,7 @@
 STATE_TITLE     = 0
 STATE_INTRO     = 1
 STATE_MAIN      = 2
+STATE_OVER      = 3             ; game over: scene frozen (Phase 0), then text (Phase 1)
 
 ;--- colours (NTSC)
 TITLE_COLOR     = $C8           ; green
@@ -52,8 +59,9 @@ SKY_LINES       = 79            ; rain/bolt loop lines (+1 transition line)
 BLOCK_LINES     = 6             ; per tree-band row
 TREE_ROWS       = 8
 TREE_LINES      = TREE_ROWS * BLOCK_LINES
-PLAYER_ROW      = 5             ; first tree-band row that draws the player (rows 5-7)
+PLAYER_ROW      = 5             ; tree-band row the player stands in (rows 5-7)
 PLAYER_Y0       = PLAYER_ROW * BLOCK_LINES
+JUMP_MAX        = 12            ; lines a jump rises (2 blocks): rows 3-7 draw the player
 GRASS_DARK_LINES = 4
 GRASS_LINES     = 192 - STATUS_LINES - CLOUD_LINES * 4 - 1 - SKY_LINES - TREE_LINES - 1 - GRASS_DARK_LINES
 
@@ -77,6 +85,13 @@ RAIN_ON         = 16            ; RainBase value when raining (tile rows 16-31)
 
 ;--- game
 TOWER_STRIKE_LOSS = 2           ; blocks burnt off the tower by a strike
+PILE_STRIKE_LOSS = 2            ; blocks burnt off a wood pile by a strike
+BOLT_MIN_X      = 19            ; the kernel's GRP1 write needs the bolt at x >= 19
+OVER_FREEZE     = 90            ; frames the final scene stays before the GAME OVER text
+OVER_COLOR      = $44           ; red
+OVER_SCALE      = 8
+OVER_TOP        = 75
+OVER_BOTTOM     = 192 - OVER_TOP - (OVER_SCALE * 5 + 1)
 PLAYER_MAX      = 152
 TOWER_ZONE      = 128           ; player x from which FIRE stacks a block
 PILE_REACH      = 10            ; |player centre - pile centre| to pick up
@@ -86,6 +101,8 @@ CARRY_NONE      = 0
 CARRY_BLOCK     = 1
 CARRY_SEED      = 2
 TARGET_TOWER    = 3
+TARGET_PILE     = 4             ; 4-6: wood pile at slot Target-4
+TARGET_PLAYER   = 7
 TARGET_NONE     = $FF
 
 ;------------------------------------------------------------------------------
@@ -119,13 +136,14 @@ BoltX       ds 1
 BoltPtr     ds 2                ; bolt graphics for the sky band (or Zeros)
 BoltPtr2    ds 2                ; bolt graphics for the tree band (Zeros - end line)
 PlayerPtr   ds 2                ; player sprite - PLAYER_Y0 (or hidden)
-Target      ds 1                ; 0-2 tree, TARGET_TOWER, TARGET_NONE
+Target      ds 1                ; 0-2 tree, TARGET_TOWER, TARGET_PILE+0..2, TARGET_PLAYER, TARGET_NONE
 TreeH       ds 3                ; trunk blocks per slot, 0 = no tree
 Pile        ds 3                ; wood blocks lying at each slot
 TowerH      ds 1
 PlayerX     ds 1
 Facing      ds 1                ; REFP0 value: 0 right, 8 left
 WalkCnt     ds 1
+JumpT       ds 1                ; 0 on the ground, else 1 + index into JumpTbl
 Carry       ds 1                ; CARRY_*
 Level       ds 1
 Goal        ds 1                ; tower height that completes the level
@@ -217,8 +235,9 @@ StatusPF2   ds 5
 
 ;------------------------------------------------------------------------------
 ; TREE_ROW row, player -- one tree-band row (BLOCK_LINES lines) from RAM with
-; the bolt (P1) and, if player=1, the player (P0; VDELP0 makes the late write
-; safe).  Y = line within the band.  Sprite tables must not cross a page.
+;the bolt (P1) and, if player=1, the player (P0; VDELP0 makes the late write
+; safe).  Y = line within the band.  Sprite reads must not cross a page: the
+; player rows read sprite-JUMP_MAX .. sprite+17+JUMP_MAX, all blank-padded.
         MAC TREE_ROW
         ldx #BLOCK_LINES
 .line   sta WSYNC
@@ -295,8 +314,12 @@ MainLoop
         SUBROUTINE
 Overscan
         lda #2
-        sta VBLANK              ; beam off
-        SET_TIMER 35            ; 35*64 cycles ~= 30 lines of overscan
+        sta VBLANK              ; beam off (line 232, cycle ~12)
+        ldx #4                  ; ~21 cycles so TIM64T is written at cycle ~42: 34*64
+.phase  dex                     ; cycles then run out at cycle ~14 of line 261, leaving the
+        bne .phase              ; wait loop + VERTICAL_SYNC's WSYNC most of that line.
+        SET_TIMER 34            ; (35 ticks ran out at cycle ~52 of line 261 and whether
+                                ; the frame was 262 or 263 lines depended on code phase.)
         jsr RebuildNext         ; redraw one changed object (runs in overscan)
 .waitOverscan
         lda INTIM
@@ -398,6 +421,7 @@ InitScene
         sta TowerH
         sta Carry
         sta Facing
+        sta JumpT
         ldx #2
 .clr    sta TreeH,x
         sta Pile,x
@@ -500,9 +524,9 @@ HideBolt
 
         SUBROUTINE
 HidePlayer
-        lda #<(Zeros-PLAYER_Y0)
+        lda #<(Zeros+JUMP_MAX-PLAYER_Y0)   ; rows 3-7 then read Zeros+0..29
         sta PlayerPtr
-        lda #>(Zeros-PLAYER_Y0)
+        lda #>(Zeros+JUMP_MAX-PLAYER_Y0)
         sta PlayerPtr+1
         rts
 
@@ -568,6 +592,11 @@ PlayLogic
         sta State
         rts
 .noReset
+        lda State
+        cmp #STATE_OVER
+        bne .scene
+        jmp OverLogic
+.scene
 
         ; bolt colour flickers white/yellow
         ldx #BOLT_COLOR_A
@@ -607,8 +636,11 @@ PlayLogic
         beq .noBolt
         dec BoltTimer
         bne .noBolt
-        jsr HideBolt
         jsr StrikeEffect
+        lda State
+        cmp #STATE_OVER
+        beq .noBolt             ; game over: the bolt stays in the frozen scene
+        jsr HideBolt
 .noBolt
 
         ; sprite positions (one line each + HMOVE line, all in VBLANK)
@@ -752,16 +784,9 @@ MainLogic
         lda Target
         bmi .done               ; nothing to strike
         cmp #TARGET_TOWER
-        bne .tree
-        lda #TREE_ROWS
-        sec
-        sbc TowerH
-        tax
-        lda Mul6,x
-        sta Tmp
-        lda #TOWER_BOLT_X
-        jmp StartStrike
-.tree   tax
+        beq .tower
+        bcs .pile
+        tax                     ; tree
         lda #TREE_ROWS-2        ; top row of the tree = 8 - (h + 2)
         sec
         sbc TreeH,x
@@ -770,34 +795,49 @@ MainLogic
         sta Tmp
         lda TreeX,x
         jmp StartStrike
+.tower  lda #TREE_ROWS
+        sec
+        sbc TowerH
+        tax
+        lda Mul6,x
+        sta Tmp
+        lda #TOWER_BOLT_X
+        jmp StartStrike
+.pile   cmp #TARGET_PLAYER
+        beq .player
+        sec
+        sbc #TARGET_PILE        ; A = slot
+        tax
+        lda #TREE_ROWS
+        sec
+        sbc Pile,x
+        tay
+        lda Mul6,y
+        sta Tmp
+        lda PileX,x
+        sec
+        sbc #4                  ; 8-wide bolt centred on the pile
+        jmp StartStrike
+.player lda #PLAYER_Y0          ; bolt ends at the player's head
+        sec
+        sbc Tmp2                ; jump height this frame (PlayerLogic)
+        sta Tmp
+        lda PlayerX
+        cmp #BOLT_MIN_X
+        bcs .px
+        lda #BOLT_MIN_X
+.px     jmp StartStrike
 .done   rts
 
-; Target = tallest object (tallest tree wins ties with the tower)
         SUBROUTINE
-PickTarget
-        lda #TARGET_NONE
-        sta Target
+GameOver                                ; freeze the scene, then show the text
+        lda #STATE_OVER
+        sta State
         lda #0
-        sta Tmp                 ; best height so far
-        ldx #2
-.scan   lda TreeH,x
-        beq .next
-        clc
-        adc #2                  ; canopy
-        cmp Tmp
-        bcc .next
-        beq .next
-        sta Tmp
-        stx Target
-.next   dex
-        bpl .scan
-        lda TowerH
-        cmp Tmp
-        bcc .done
-        beq .done
-        lda #TARGET_TOWER
-        sta Target
-.done   rts
+        sta Phase
+        lda #OVER_FREEZE
+        sta Timer
+        rts
 
 ; The bolt has finished: apply the strike
         SUBROUTINE
@@ -807,6 +847,10 @@ StrikeEffect
         bne .done
         ldx Target
         bmi .done
+        cpx #TARGET_PLAYER
+        beq .hit
+        cpx #TARGET_PILE
+        bcs .pile
         lda BitTbl,x
         ora Dirty
         sta Dirty
@@ -830,6 +874,20 @@ StrikeEffect
 .towerOk
         sta TowerH
 .done   rts
+.pile   txa                     ; pile burns
+        sec
+        sbc #TARGET_PILE
+        tax
+        jsr DirtySlot
+        lda Pile,x
+        sec
+        sbc #PILE_STRIKE_LOSS
+        bcs .pileOk2
+        lda #0
+.pileOk2
+        sta Pile,x
+        rts
+.hit    jmp GameOver
 
 ;------------------------------------------------------------------------------
         SUBROUTINE
@@ -865,7 +923,25 @@ PlayerLogic
         asl
         ora Tmp                 ; Carry*2 + frame
         tax
+        ; jump: UP on the ground takes off, then JumpT steps through JumpTbl
+        ldy JumpT
+        bne .air
+        lda SWCHA
+        and #$10                ; bit 4 up (0 = pushed)
+        bne .ground
+        iny                     ; take off
+.air    lda JumpTbl-1,y         ; height this frame, $FF = arc over
+        bpl .rising
+.ground ldy #0
+        lda #0
+        beq .setJump            ; always
+.rising iny
+.setJump
+        sty JumpT
+        sta Tmp2                ; lines above the ground
         lda PlayerLo,x
+        clc
+        adc Tmp2                ; same page: see the sprite page layout
         sta PlayerPtr
         lda PlayerHi,x
         sta PlayerPtr+1
@@ -1171,6 +1247,13 @@ RowColors
 ;------------------------------------------------------------------------------
         SUBROUTINE
 SceneKernel
+        lda State
+        cmp #STATE_OVER
+        bne SceneDraw
+        lda Phase
+        beq SceneDraw           ; frozen final scene
+        jmp OverKernel
+SceneDraw
         ; --- status line (STATUS_LINES): digits in the left playfield ---
         lda SkyNow
         sta COLUBK
@@ -1247,8 +1330,8 @@ SceneKernel
         TREE_ROW 0, 0
         TREE_ROW 1, 0
         TREE_ROW 2, 0
-        TREE_ROW 3, 0
-        TREE_ROW 4, 0
+        TREE_ROW 3, 1
+        TREE_ROW 4, 1
         TREE_ROW 5, 1
         TREE_ROW 6, 1
         TREE_ROW 7, 1
@@ -1280,33 +1363,122 @@ SkipLines
 
 ;------------------------------------------------------------------------------
 ; small tables
-Mul6        .byte 0,6,12,18,24,30,36,42,48
-BitTbl      .byte 1,2,4,8
 TreeX       .byte 26,74,122     ; bolt sprite x (8 wide) centred on tree columns 7,19,31
 PileX       .byte 28,76,124     ; pile centres in pixels
 GroundX     .byte 50,98         ; intro ground strikes, between the slots
 TOWER_BOLT_X = 144              ; tower at playfield columns 36-37
 HeightTbl   .byte 2,3,4,4       ; random tree heights (levels 2+)
 IntervalTbl .byte 240,210,180,150,120,90,90,90   ; frames between strikes, by level
-PlayerLo    .byte <(PlayerStandNone-PLAYER_Y0),<(PlayerWalkNone-PLAYER_Y0)
-            .byte <(PlayerStandBlock-PLAYER_Y0),<(PlayerWalkBlock-PLAYER_Y0)
-            .byte <(PlayerStandSeed-PLAYER_Y0),<(PlayerWalkSeed-PLAYER_Y0)
-PlayerHi    .byte >(PlayerStandNone-PLAYER_Y0),>(PlayerWalkNone-PLAYER_Y0)
-            .byte >(PlayerStandBlock-PLAYER_Y0),>(PlayerWalkBlock-PLAYER_Y0)
-            .byte >(PlayerStandSeed-PLAYER_Y0),>(PlayerWalkSeed-PLAYER_Y0)
 
         align 256               ; text tables in one page (no page-cross cycles)
         include "rainstorm_text.inc"
 
         include "rainstorm_gfx.inc"     ; clouds, rain, slot patterns, digits, BoltGfx
 
-        ; BoltBand, Zeros and the player sprites must share one page (the tree-band
-        ; kernel has no spare cycles for page crossing) and BoltBand must directly
-        ; precede Zeros (StartStrike points BoltPtr2 at Zeros - end line).
+; Target = tallest object, in blocks: tree trunks (the canopy does not count),
+; wood piles, the tower and the player (2 blocks, +1 per 6 lines of jump).
+; Ties go to the tower, then the leftmost tree, then the leftmost pile; the
+; player loses every tie.  Lives here because the main code region is full.
+        SUBROUTINE
+PickTarget
+        lda #TARGET_NONE
+        sta Target
+        lda #0
+        sta Tmp                 ; best height so far
+        ldx #2
+.pscan  lda Pile,x
+        beq .pnext
+        cmp Tmp
+        bcc .pnext
+        sta Tmp
+        txa
+        clc
+        adc #TARGET_PILE
+        sta Target
+.pnext  dex
+        bpl .pscan
+        ldx #2
+.scan   lda TreeH,x
+        beq .next
+        cmp Tmp
+        bcc .next
+        sta Tmp
+        stx Target
+.next   dex
+        bpl .scan
+        lda TowerH
+        beq .player
+        cmp Tmp
+        bcc .player
+        sta Tmp
+        lda #TARGET_TOWER
+        sta Target
+.player ldx Tmp2                ; jump height this frame (PlayerLogic ran first)
+        cpx #6
+        lda #2
+        adc #0                  ; +1 from 6 lines up
+        cpx #12
+        adc #0                  ; +1 more at the top (12 lines)
+        cmp Tmp
+        bcc .done
+        beq .done
+        lda #TARGET_PLAYER
+        sta Target
+.done   rts
+
+        ; BoltBand and Zeros share one page (the tree-band kernel has no spare cycles
+        ; for page crossing) and BoltBand must directly precede Zeros (StartStrike
+        ; points BoltPtr2 at Zeros - end line).
         align 256
         include "rainstorm_bolt.inc"    ; BoltBand (TREE_LINES bytes)
 Zeros       ds SKY_LINES                ; blank sprite data; must cover the longest band
-        include "rainstorm_player.inc"  ; 6 x 18 bytes
+
+        ; rest of this page: the GAME OVER screen (text tables read with abs,Y: no crossing)
+        include "rainstorm_over.inc"    ; Over_PF0L..PF2R (30 bytes)
+
+        SUBROUTINE
+OverLogic
+        lda Phase
+        bne .text
+        dec Timer
+        bne .done
+        inc Phase
+.done   rts
+.text   lda FirePressed
+        beq .done
+        lda #STATE_TITLE
+        sta State
+        rts
+
+OverKernel                              ; 192 lines: black, "GAME OVER"
+        lda #0
+        sta COLUBK
+        lda #OVER_COLOR
+        sta COLUPF
+        ldx #OVER_TOP
+        jsr SkipLines
+        PF_TEXT Over, OVER_SCALE
+        ldx #OVER_BOTTOM
+        jmp SkipLines
+
+        ; Player sprite page.  PlayerPtr = sprite - PLAYER_Y0 + jump (0..JUMP_MAX) and
+        ; the band reads sprite - JUMP_MAX .. sprite + 17 + JUMP_MAX, so everything from
+        ; sprite - PLAYER_Y0 on must sit in one page: JumpTbl (>= 18 bytes) fills the
+        ; start, then JUMP_MAX blank rows, then the 6 frames, each followed by
+        ; JUMP_MAX blank rows (generated).
+        align 256
+JumpTbl     .byte 2,4,6,8,9,10,11,12,12,12,12,12,11,10,9,8,6,4,2,0,$FF
+            ds JUMP_MAX
+        include "rainstorm_player.inc"  ; 6 x (18 + JUMP_MAX) bytes
+        ; tables that did not fit in the main code region
+Mul6        .byte 0,6,12,18,24,30,36,42,48
+BitTbl      .byte 1,2,4,8
+PlayerLo    .byte <(PlayerStandNone-PLAYER_Y0),<(PlayerWalkNone-PLAYER_Y0)
+            .byte <(PlayerStandBlock-PLAYER_Y0),<(PlayerWalkBlock-PLAYER_Y0)
+            .byte <(PlayerStandSeed-PLAYER_Y0),<(PlayerWalkSeed-PLAYER_Y0)
+PlayerHi    .byte >(PlayerStandNone-PLAYER_Y0),>(PlayerWalkNone-PLAYER_Y0)
+            .byte >(PlayerStandBlock-PLAYER_Y0),>(PlayerWalkBlock-PLAYER_Y0)
+            .byte >(PlayerStandSeed-PLAYER_Y0),>(PlayerWalkSeed-PLAYER_Y0)
 
         echo "ROM bytes free:", ($FFFC - *)d
 
