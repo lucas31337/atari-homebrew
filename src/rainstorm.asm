@@ -14,13 +14,14 @@
 ;                  The player walks (joystick), jumps 2 blocks high (UP), picks up blocks
 ;                  and stacks them on the tower at the right edge (FIRE).  When all trees are gone the player
 ;                  holds a seed; FIRE plants it in the nearest empty slot.  Tower height
-;                  >= goal -> next level (new trees, random heights, faster lightning).
+;                  >= goal, or the round clock (30 s, +30 s per round) running out -> next
+;                  level (new trees, random heights, faster lightning).
 ;                  Console RESET (F2 in Stella) returns to the title from anywhere.
 ;
 ; Frame:   3 VSYNC + 37 VBLANK + 192 visible + 30 overscan = 262 lines
 ;          (RIOT timers; see Overscan for why their run-out cycle must sit early in a line)
 ; Scene kernel, top to bottom (192 lines):
-;          8 status (level / tower / goal digits) | 24 clouds (playfield, 4 rows) |
+;          12 status (level / tower / seconds left) | 24 clouds (playfield, 4 rows) |
 ;          1+79 sky with rain (playfield) and the lightning bolt (P1) |
 ;          48 tree band: 8 rows of 6 lines, playfield from RAM (trees, wood piles, tower),
 ;          bolt (P1) and the player (P0, rows 3-7: stands in 5-7, jumps 2 rows) | 1+31 grass
@@ -32,6 +33,7 @@ STATE_TITLE     = 0
 STATE_INTRO     = 1
 STATE_MAIN      = 2
 STATE_OVER      = 3             ; game over: scene frozen (Phase 0), then text (Phase 1)
+STATE_ROUND     = 4             ; "ROUND n" text screen between rounds (Phase 1)
 
 ;--- colours (NTSC)
 TITLE_COLOR     = $C8           ; green
@@ -84,14 +86,18 @@ RAIN_SPEED      = 3             ; rain tile rows per frame
 RAIN_ON         = 16            ; RainBase value when raining (tile rows 16-31)
 
 ;--- game
+ROUND_SEC_STEP  = $30           ; BCD seconds: round 1 gets 30, each round 30 more (max 99)
 TOWER_STRIKE_LOSS = 2           ; blocks burnt off the tower by a strike
 PILE_STRIKE_LOSS = 2            ; blocks burnt off a wood pile by a strike
 BOLT_MIN_X      = 19            ; the kernel's GRP1 write needs the bolt at x >= 19
 OVER_FREEZE     = 90            ; frames the final scene stays before the GAME OVER text
-OVER_COLOR      = $44           ; red
-OVER_SCALE      = 8
-OVER_TOP        = 75
-OVER_BOTTOM     = 192 - OVER_TOP - (OVER_SCALE * 5 + 1)
+ROUND_SHOW      = 120           ; frames the ROUND n screen stays
+OVER_COLOR      = $44           ; red (GAME OVER); ROUND uses TITLE_COLOR
+TEXT_SCALE      = 8             ; text screen: lines per font row
+DIGIT_LINES     = 40            ; the big round number: 5 glyph rows x 8 lines
+TEXT_TOP        = 40
+TEXT_GAP        = 16
+TEXT_BOTTOM     = 192 - TEXT_TOP - (TEXT_SCALE * 5 + 1) - TEXT_GAP - DIGIT_LINES
 PLAYER_MAX      = 152
 TOWER_ZONE      = 128           ; player x from which FIRE stacks a block
 PILE_REACH      = 10            ; |player centre - pile centre| to pick up
@@ -122,6 +128,8 @@ Obj         ds 1                ; Rebuild: tree slot
 Phase       ds 1                ; sub-state within INTRO
 Timer       ds 1                ; frame countdown for the current phase step
 Count       ds 1                ; generic counter for the current phase
+CountTick   = Timer             ; MAIN reuses the intro-only vars: frames left in this second
+RoundSec    = Count             ;   and this round's length, BCD seconds
 CloudOffset ds 1                ; 0..CLOUD_STEPS
 CloudColor  ds 1
 SkyColor    ds 1
@@ -142,7 +150,7 @@ Pile        ds 3                ; wood blocks lying at each slot
 TowerH      ds 1
 PlayerX     ds 1
 Facing      ds 1                ; REFP0 value: 0 right, 8 left
-WalkCnt     ds 1
+CountSec    ds 1                ; seconds left in the round, BCD (status line)
 JumpT       ds 1                ; 0 on the ground, else 1 + index into JumpTbl
 Carry       ds 1                ; CARRY_*
 Level       ds 1
@@ -169,42 +177,21 @@ StatusPF2   ds 5
         ENDM
 
 ;------------------------------------------------------------------------------
-; PF_TEXT label, scale -- draw 5-row asymmetric playfield text from the
-; label_PF0L..label_PF2R tables, each row repeated 'scale' scanlines.
-; Uses 5*scale+1 scanlines and leaves the playfield cleared.
-; Cycle counts are from the end of WSYNC; right-half writes must land after
-; the left half is drawn and before the right half starts:
-;   PF0 right 28..49, PF1 right 39..54, PF2 right 50..65
-        MAC PF_TEXT
-        ldy #4
-.row    ldx #{2}
-.line   sta WSYNC
-        lda {1}_PF0L,y          ; 4
-        sta PF0                 ; 7
-        lda {1}_PF1L,y          ; 11
-        sta PF1                 ; 14
-        lda {1}_PF2L,y          ; 18
-        sta PF2                 ; 21
-        lda {1}_PF0R,y          ; 25
-        nop                     ; 27
-        sta PF0                 ; 30
-        lda {1}_PF1R,y          ; 34
-        nop                     ; 36
-        nop                     ; 38
-        sta PF1                 ; 41
-        lda {1}_PF2R,y          ; 45
-        nop                     ; 47
-        nop                     ; 49
-        sta PF2                 ; 52
-        dex
-        bne .line
-        dey
-        bpl .row
-        sta WSYNC
-        lda #0
-        sta PF0
-        sta PF1
-        sta PF2
+; TEXT label, scale -- draw 5-row asymmetric playfield text from the
+; label_PF0L..label_PF2R tables (DrawText), each row 'scale' scanlines.
+        MAC TEXT
+        lda #<{1}_PF0L
+        sta Tmp
+        lda #>{1}_PF0L
+        ldx #{2}
+        jsr DrawText
+        ENDM
+; TEXTS label, scale -- same, for a table in the same page as the previous TEXT
+        MAC TEXTS
+        lda #<{1}_PF0L
+        sta Tmp
+        ldx #{2}
+        jsr DrawTextLo
         ENDM
 
 ;------------------------------------------------------------------------------
@@ -370,30 +357,83 @@ TitleLogic
         jmp InitScene
 .stay   rts
 
+; Draw 5-row playfield text.  A = page of the tables, X = lines per row,
+; Tmp = low byte of label_PF0L; PF1L/PF2L follow at +5/+10 and the right
+; halves at +15 (pftext.ps1 layout, 30 bytes in one page).  Uses 5*X+1 lines
+; and leaves the playfield cleared.  Borrows the sprite pointers, which only
+; the scene kernel uses (InitScene resets them).
+; Cycle counts are from the end of WSYNC; right-half writes must land after
+; the left half is drawn and before the right half starts:
+;   PF0 right 28..49, PF1 right 39..54, PF2 right 50..65
+        SUBROUTINE
+DrawText
+        sta BoltPtr+1
+        sta BoltPtr2+1
+        sta PlayerPtr+1
+DrawTextLo                      ; entry when the page bytes are already set
+        stx Cnt                 ; lines per row
+        lda Tmp
+        sta BoltPtr             ; PF0 tables
+        clc
+        adc #5
+        sta BoltPtr2            ; PF1 tables
+        adc #5                  ; (carry clear: a table group never wraps a page)
+        sta PlayerPtr           ; PF2 tables
+        lda #4
+        sta Tmp                 ; row
+.row    ldx Cnt                 ; 72 from the previous row's last line: the row
+.line   sta WSYNC               ; 75 change must fit in the line, so no extra work here
+        ldy Tmp                 ; 3
+        lda (BoltPtr),y         ; 8
+        sta PF0                 ; 11
+        lda (BoltPtr2),y        ; 16
+        sta PF1                 ; 19
+        lda (PlayerPtr),y       ; 24
+        sta PF2                 ; 27
+        tya                     ; 29
+        adc #15                 ; 31  right-half index (carry is always clear here)
+        tay                     ; 33
+        lda (BoltPtr),y         ; 38
+        sta PF0                 ; 41  right PF0 (28..49)
+        lda (BoltPtr2),y        ; 46
+        sta PF1                 ; 49  right PF1 (39..54)
+        lda (PlayerPtr),y       ; 54
+        sta PF2                 ; 57  right PF2 (50..65)
+        dex                     ; 59
+        bne .line               ; 62
+        dec Tmp                 ; 66
+        bpl .row                ; 69
+        sta WSYNC
+        lda #0
+        sta PF0
+        sta PF1
+        sta PF2
+        rts
+
 TitleKernel
         lda #TITLE_COLOR
         sta COLUPF
         ldx #TOP_GAP
         jsr SkipLines
-        PF_TEXT Title, TITLE_SCALE
+        TEXT Title, TITLE_SCALE
         lda #AUTHOR_COLOR
         sta COLUPF
         ldx #BY_GAP
         jsr SkipLines
-        PF_TEXT By, BY_SCALE
+        TEXTS By, BY_SCALE
         ldx #AUTHOR_GAP
         jsr SkipLines
-        PF_TEXT Author, AUTHOR_SCALE
+        TEXTS Author, AUTHOR_SCALE
         lda StartColor
         sta COLUPF
         ldx #MID_GAP
         jsr SkipLines
-        PF_TEXT Start, START_SCALE
+        TEXTS Start, START_SCALE
         ldx #BOTTOM_GAP
         jmp SkipLines           ; tail call
 
 ; Title screen layout, top to bottom, in scanlines (must total 192).
-; Each PF_TEXT block takes scale*5+1 lines (+1 for the line that clears the playfield).
+; Each TEXT block takes scale*5+1 lines (+1 for the line that clears the playfield).
 TITLE_SCALE     = 8             ; scanlines per font row
 BY_SCALE        = 2
 AUTHOR_SCALE    = 2
@@ -410,28 +450,11 @@ BOTTOM_GAP      = 192 - TOP_GAP - BY_GAP - AUTHOR_GAP - MID_GAP - TEXT_LINES
 ;==============================================================================
         SUBROUTINE
 InitScene
-        lda #0
-        sta CloudOffset
-        sta RainBase
-        sta RainScroll
-        sta FlashTimer
-        sta BoltTimer
-        sta Phase
-        sta Count
-        sta TowerH
-        sta Carry
-        sta Facing
-        sta JumpT
-        ldx #2
-.clr    sta TreeH,x
-        sta Pile,x
+        lda #0                  ; clear everything from Phase to the status digits
+        ldx #StatusPF2+5-Phase-1 ; (what needs a value is set below or per level)
+.clr    sta Phase,x
         dex
         bpl .clr
-        ldx #TREE_ROWS*6+TREE_ROWS+10-1
-.clrs   sta Rows,x              ; Rows, RowColor and the status digits are adjacent
-        dex
-        bpl .clrs
-        sta Dirty
         lda #TARGET_NONE
         sta Target
         lda #CLOUD_WHITE
@@ -444,8 +467,7 @@ InitScene
         sta PlayerX
         lda #26
         sta BoltX
-        jsr HideBolt
-        jsr HidePlayer
+        jsr HideBolt            ; hides the player too
         lda #STATE_INTRO
         sta State
         rts
@@ -479,12 +501,39 @@ NewLevel
         bcc .goalOk
         lda #TREE_ROWS
 .goalOk sta Goal
+        ; round clock: 30 s on level 1, 30 s more per level, max 99 (BCD)
+        lda Level
+        cmp #1
+        bne .clock
+        lda #0
+        sta RoundSec
+.clock  sed
+        clc
+        lda RoundSec
+        adc #ROUND_SEC_STEP
+        bcc .clockOk
+        lda #$99
+.clockOk
+        cld
+        sta RoundSec
+        sta CountSec
+        lda #60
+        sta CountTick
         jsr StrikeInterval
         lda #$0F
         sta Dirty
         lda #PLAYER_COLOR
         sta COLUP0
-        rts
+        lda Level
+        cmp #1
+        beq .first
+        lda #STATE_ROUND        ; "ROUND n" screen before play resumes (TextLogic)
+        sta State
+        lda #1
+        sta Phase               ; text phase (as in STATE_OVER)
+        lda #ROUND_SHOW
+        sta Timer
+.first  rts
 
 ; A = height for a new tree (4 on level 1, else 2..4), preserves X
         SUBROUTINE
@@ -513,22 +562,18 @@ StrikeInterval
         rts
 
         SUBROUTINE
-HideBolt
-        lda #<Zeros
+HideBolt                                ; also hides the player (MAIN's PlayerLogic
+        lda #<Zeros                     ; sets PlayerPtr again later in the same frame)
         sta BoltPtr
         sta BoltPtr2
+        lda #<(Zeros+JUMP_MAX-PLAYER_Y0) ; rows 3-7 then read Zeros+0..29
+        sta PlayerPtr
         lda #>Zeros
         sta BoltPtr+1
         sta BoltPtr2+1
-        rts
-
-        SUBROUTINE
-HidePlayer
-        lda #<(Zeros+JUMP_MAX-PLAYER_Y0)   ; rows 3-7 then read Zeros+0..29
-        sta PlayerPtr
-        lda #>(Zeros+JUMP_MAX-PLAYER_Y0)
         sta PlayerPtr+1
         rts
+
 
 ; Occasionally flash the sky and clouds (lightning inside the clouds).
         SUBROUTINE
@@ -594,8 +639,8 @@ PlayLogic
 .noReset
         lda State
         cmp #STATE_OVER
-        bne .scene
-        jmp OverLogic
+        bcc .scene
+        jmp TextLogic           ; GAME OVER / ROUND n
 .scene
 
         ; bolt colour flickers white/yellow
@@ -773,6 +818,7 @@ MainLogic
         lda #CARRY_SEED
         sta Carry
 .noSeed
+        jsr Countdown
 
         ; lightning
         lda BoltTimer
@@ -829,15 +875,84 @@ MainLogic
 .px     jmp StartStrike
 .done   rts
 
+; Text screens.  STATE_OVER: Phase 0 = frozen scene for Timer frames, then
+; Phase 1 = GAME OVER text until FIRE (-> title).  STATE_ROUND: ROUND n text
+; for Timer frames, then the game resumes.
         SUBROUTINE
-GameOver                                ; freeze the scene, then show the text
-        lda #STATE_OVER
+TextLogic
+        lda Phase
+        bne .text
+        dec Timer
+        bne .done
+        inc Phase
+.done   rts
+.text   lda State
+        cmp #STATE_ROUND
+        beq .round
+        lda FirePressed
+        beq .done
+        lda #STATE_TITLE
         sta State
-        lda #0
-        sta Phase
-        lda #OVER_FREEZE
-        sta Timer
         rts
+.round  dec Timer
+        bne .done
+        lda #STATE_MAIN
+        sta State
+        lda #60
+        sta CountTick           ; Timer doubles as the clock's frame counter
+        rts
+
+; The round number as one big digit: 5 glyph rows of 8 lines, centred
+; (PF2 left, bits 2-4, like the old goal digit).  DIGIT_LINES lines.
+        SUBROUTINE
+DrawDigit
+        lda Level
+        ldx #0
+        jsr Times5
+        sty Tmp                 ; glyph index of row 0
+        ldx #0
+.line   sta WSYNC
+        txa                     ; 2
+        lsr                     ; 4
+        lsr                     ; 6
+        lsr                     ; 8   row = line / 8
+        clc                     ; 10
+        adc Tmp                 ; 13
+        tay                     ; 15
+        lda DigitR,y            ; 19
+        asl                     ; 21
+        asl                     ; 23
+        sta PF2                 ; 26  left PF2 (cols 18-20), shown from cycle 38
+        ldy #4                  ; 28
+.wait   dey                     ; 4 iterations: 19 cycles
+        bne .wait               ; 47
+        lda #0                  ; 49
+        sta PF2                 ; 52  clear the right half (50..65)
+        inx                     ; 54
+        cpx #DIGIT_LINES        ; 56
+        bne .line               ; 59
+        rts
+
+; Round clock: one second per 60 frames; at 0 the next round starts
+        SUBROUTINE
+Countdown
+        dec CountTick
+        bne .done
+        lda #60
+        sta CountTick
+        sed
+        sec
+        lda CountSec
+        sbc #1
+        cld
+        sta CountSec
+        bne .show
+        inc Level
+        jmp NewLevel            ; time's up: next round
+.show   lda Dirty
+        ora #8                  ; the tower rebuild also redraws the status line
+        sta Dirty
+.done   rts
 
 ; The bolt has finished: apply the strike
         SUBROUTINE
@@ -887,7 +1002,13 @@ StrikeEffect
 .pileOk2
         sta Pile,x
         rts
-.hit    jmp GameOver
+.hit    lda #STATE_OVER         ; the bolt hit the player: freeze the scene,
+        sta State               ; then the GAME OVER text (TextLogic)
+        lda #0
+        sta Phase
+        lda #OVER_FREEZE
+        sta Timer
+        rts
 
 ;------------------------------------------------------------------------------
         SUBROUTINE
@@ -910,8 +1031,7 @@ PlayerLogic
         inc PlayerX
         lda #0
         sta Facing
-.moved  inc WalkCnt
-        lda WalkCnt
+.moved  lda Frame
         and #8                  ; walk frame every 8 frames
         bne .frame
 .idle   lda #0
@@ -943,7 +1063,7 @@ PlayerLogic
         clc
         adc Tmp2                ; same page: see the sprite page layout
         sta PlayerPtr
-        lda PlayerHi,x
+        lda #>PlayerStandNone   ; all player sprites are in one page
         sta PlayerPtr+1
         lda Facing
         sta REFP0
@@ -1018,15 +1138,12 @@ DirtySlot
         sta Dirty
         rts
 
-; Status line: level | tower height | goal
+; Status line: level | tower height | seconds left
         SUBROUTINE
 StatusDigits
         ldx #4
 .row    lda Level
-        cmp #10
-        bcc .lv
-        lda #9
-.lv     jsr Times5
+        jsr Times5
         lda DigitL,y
         asl
         asl
@@ -1039,11 +1156,25 @@ StatusDigits
         lda DigitL,y
         ora Tmp
         sta StatusPF1,x
-        lda Goal
+        lda CountSec            ; two BCD digits in PF2 (bit 0 = left): tens at
+        and #$0F                ; bits 1-3, ones at bits 5-7
         jsr Times5
         lda DigitR,y
         asl
         asl
+        asl
+        asl
+        asl
+        sta Tmp
+        lda CountSec
+        lsr
+        lsr
+        lsr
+        lsr
+        jsr Times5
+        lda DigitR,y
+        asl
+        ora Tmp
         sta StatusPF2,x
         dex
         bpl .row
@@ -1249,10 +1380,10 @@ RowColors
 SceneKernel
         lda State
         cmp #STATE_OVER
-        bne SceneDraw
+        bcc SceneDraw
         lda Phase
-        beq SceneDraw           ; frozen final scene
-        jmp OverKernel
+        beq SceneDraw           ; frozen final scene (GAME OVER, Phase 0)
+        jmp TextKernel
 SceneDraw
         ; --- status line (STATUS_LINES): digits in the left playfield ---
         lda SkyNow
@@ -1433,32 +1564,35 @@ PickTarget
         include "rainstorm_bolt.inc"    ; BoltBand (TREE_LINES bytes)
 Zeros       ds SKY_LINES                ; blank sprite data; must cover the longest band
 
-        ; rest of this page: the GAME OVER screen (text tables read with abs,Y: no crossing)
+        ; rest of this page: the text screens (tables read through DrawText's pointers:
+        ; a 30-byte table must not cross a page)
         include "rainstorm_over.inc"    ; Over_PF0L..PF2R (30 bytes)
+        include "rainstorm_round.inc"   ; Round_PF0L..PF2R (30 bytes)
 
         SUBROUTINE
-OverLogic
-        lda Phase
-        bne .text
-        dec Timer
-        bne .done
-        inc Phase
-.done   rts
-.text   lda FirePressed
-        beq .done
-        lda #STATE_TITLE
-        sta State
-        rts
-
-OverKernel                              ; 192 lines: black, "GAME OVER"
-        lda #0
+TextKernel                              ; 192 lines: black; GAME OVER (red) or
+        lda #0                          ; ROUND (green), then the big round number
         sta COLUBK
-        lda #OVER_COLOR
-        sta COLUPF
-        ldx #OVER_TOP
+        lda State
+        cmp #STATE_ROUND
+        beq .round
+        ldx #<Over_PF0L
+        lda #>Over_PF0L
+        ldy #OVER_COLOR
+        bne .go                 ; always (A = page)
+.round  ldx #<Round_PF0L
+        lda #>Round_PF0L
+        ldy #TITLE_COLOR
+.go     sty COLUPF
+        stx Tmp
+        ldx #TEXT_TOP
+        jsr SkipLines           ; keeps A
+        ldx #TEXT_SCALE
+        jsr DrawText
+        ldx #TEXT_GAP
         jsr SkipLines
-        PF_TEXT Over, OVER_SCALE
-        ldx #OVER_BOTTOM
+        jsr DrawDigit
+        ldx #TEXT_BOTTOM
         jmp SkipLines
 
         ; Player sprite page.  PlayerPtr = sprite - PLAYER_Y0 + jump (0..JUMP_MAX) and
@@ -1476,9 +1610,6 @@ BitTbl      .byte 1,2,4,8
 PlayerLo    .byte <(PlayerStandNone-PLAYER_Y0),<(PlayerWalkNone-PLAYER_Y0)
             .byte <(PlayerStandBlock-PLAYER_Y0),<(PlayerWalkBlock-PLAYER_Y0)
             .byte <(PlayerStandSeed-PLAYER_Y0),<(PlayerWalkSeed-PLAYER_Y0)
-PlayerHi    .byte >(PlayerStandNone-PLAYER_Y0),>(PlayerWalkNone-PLAYER_Y0)
-            .byte >(PlayerStandBlock-PLAYER_Y0),>(PlayerWalkBlock-PLAYER_Y0)
-            .byte >(PlayerStandSeed-PLAYER_Y0),>(PlayerWalkSeed-PLAYER_Y0)
 
         echo "ROM bytes free:", ($FFFC - *)d
 
