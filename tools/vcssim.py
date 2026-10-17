@@ -4,9 +4,13 @@ Counts scanlines per frame from VSYNC to VSYNC and reports anything that is
 not 262.  Needs the py65 package:
     python -m venv .venv && .venv\\Scripts\\pip install py65
 Usage: python tools/vcssim.py rom.a26 FRAMES [INPUT ...]
-  INPUT tokens: "<frame>:<keys>" or "<from>-<to>:<keys>", keys from F (fire), L, R, U (up = jump)
+  INPUT tokens: "<frame>:<keys>" or "<from>-<to>:<keys>", keys from F (fire), L, R, U (up = jump);
+  "A<from>-<to>" logs the TIA audio register writes (AUDC/AUDF/AUDV) in those frames;
+  "B0" starts an 8K (F8) ROM in bank 0 instead of bank 1 (power-up bank is random on real hardware).
+  "<frame>P<addr>=<value>" (hex) pokes a RAM byte at the start of that frame, e.g. 1200P9F=0.
   e.g. python tools/vcssim.py bin/rainstorm.a26 900 3:F 700-760:L 770:F
-Prints the game variables (RAM $80..) at the end.
+Prints the game variables (RAM $80..) and the deepest stack use at the end.
+8K ROMs are F8 bank-switched (hotspots $1FF8/$1FF9).
 """
 import sys
 from py65.devices.mpu6502 import MPU
@@ -14,7 +18,15 @@ from py65.devices.mpu6502 import MPU
 rom = open(sys.argv[1], 'rb').read()
 FRAMES = int(sys.argv[2]) if len(sys.argv) > 2 else 5
 events = []   # (first, last, keys)
+audio = None  # (first, last) frames whose audio writes are logged
+start_bank = 1
+pokes = []    # (frame, address, value)
 for tok in sys.argv[3:]:
+    if tok == 'B0': start_bank = 0; continue
+    if 'P' in tok and '=' in tok:
+        f, rest = tok.split('P'); a, v = rest.split('='); pokes.append((int(f), int(a, 16), int(v, 16))); continue
+    if tok.startswith('A'):
+        a, b = (tok[1:].split('-') + [None])[:2]; audio = (int(a), int(b) if b else int(a)); continue
     span, keys = tok.split(':')
     a, b = (span.split('-') + [None])[:2]
     events.append((int(a), int(b) if b else int(a) + 1, keys.upper()))
@@ -33,6 +45,7 @@ class Mem:
         s.wsync = False; s.timer_set = 0; s.timer_val = 0; s.timer_int = 64
         s.vsync_on = False; s.frame_start = 0; s.frames = []; s.frame = 0
         s.pending = False; s.segs = []   # (frame, timer ticks, cycles from TIM64T to the first INTIM read)
+        s.bank = start_bank if len(rom) > 0x1000 else 0; s.switches = 0; s.audio = []
 
     def cyc(s): return s.cpu.processorCycles
     def __len__(s): return 0x10000
@@ -40,7 +53,9 @@ class Mem:
     def __getitem__(s, a):
         if isinstance(a, slice): return [s[i] for i in range(*a.indices(0x10000))]
         a &= 0x1FFF
-        if a & 0x1000: return rom[a & 0xFFF]
+        if a & 0x1000:
+            s.hotspot(a)
+            return rom[(s.bank << 12) | (a & 0xFFF)]
         if a & 0x80:
             if a & 0x200:
                 r = a & 0x7
@@ -62,9 +77,13 @@ class Mem:
             return 0x00 if 'F' in keys_at(s.frame) else 0x80
         return 0
 
+    def hotspot(s, a):
+        if len(rom) > 0x1000 and (a == 0x1FF8 or a == 0x1FF9):
+            s.bank = a & 1; s.switches += 1
+
     def __setitem__(s, a, v):
         a &= 0x1FFF
-        if a & 0x1000: return
+        if a & 0x1000: s.hotspot(a); return
         if a & 0x80:
             if a & 0x200:
                 if (a & 0x17) == 0x16:  # TIM64T
@@ -77,15 +96,21 @@ class Mem:
             if on and not s.vsync_on:
                 s.frames.append((s.cyc() - s.frame_start) / 76); s.frame += 1
                 s.frame_start = s.cyc()
+                for f, a, v in pokes:
+                    if f == s.frame: s.ram[a & 0x7F] = v
             s.vsync_on = on
         elif r == 0x02: s.wsync = True
+        elif 0x15 <= r <= 0x1A and audio and audio[0] <= s.frame <= audio[1]:
+            s.audio.append((s.frame, ('AUDC0', 'AUDC1', 'AUDF0', 'AUDF1', 'AUDV0', 'AUDV1')[r - 0x15], v))
 
 
 m = Mem()
 cpu = MPU(memory=m); m.cpu = cpu
-cpu.pc = rom[0xFFC] | (rom[0xFFD] << 8)
+cpu.pc = m[0xFFFC] | (m[0xFFFD] << 8)
+min_sp = 0xFF
 while m.frame <= FRAMES:
     cpu.step()
+    if cpu.sp < min_sp and m.frame > 0: min_sp = cpu.sp   # (the power-on RAM clear pushes through the whole page)
     if m.wsync:
         m.wsync = False
         cpu.processorCycles += (76 - (cpu.processorCycles - m.frame_start) % 76) % 76
@@ -100,3 +125,10 @@ for ticks in sorted({t for _, t, _ in m.segs}):
 for f, _ in bad[:5]:
     print(f'frame {f}:', ', '.join(f'timer {t}: {el}' for ff, t, el in m.segs if ff == f))
 print('RAM $80-$BF:', ' '.join(f'{b:02X}' for b in m.ram[0:64]))
+print(f'deepest stack: SP ${min_sp:02X} ({0xFF - min_sp} bytes)' + (f'; {m.switches} bank switches, ends in bank {m.bank}' if len(rom) > 0x1000 else ''))
+if audio:
+    last = None
+    for f, reg, v in m.audio:
+        if f != last: print(f'\nframe {f}:', end=''); last = f
+        print(f' {reg}={v}', end='')
+    print()

@@ -1,5 +1,5 @@
 # Usage: .\build.ps1 hello [-Run]
-# Assembles src\<name>.asm -> bin\<name>.a26 (4K, raw binary) and optionally opens it in Stella.
+# Assembles src\<name>.asm -> bin\<name>.a26 (8K F8, raw binary) and optionally opens it in Stella.
 param(
     [Parameter(Mandatory)] [string]$Name,
     [switch]$Run

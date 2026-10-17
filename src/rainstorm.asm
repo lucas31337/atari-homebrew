@@ -1,8 +1,13 @@
-; rainstorm.asm - RAINSTORM (4K, NTSC)  -- see docs/GAMEPLAY.md
+; rainstorm.asm - RAINSTORM (8K F8, NTSC)  -- see docs/GAMEPLAY.md
+;
+; Bank 1 ($F000-$FFFF, file offset $1000) is the game; bank 0 holds the TIATracker
+; music player and the songs (src/tt_player.asm, src/rainstorm_music.inc) and is
+; only entered through the MusicPlay/MusicStart stubs at the start of both banks.
 ;
 ; States:  TITLE - "RAINSTORM / BY / LUCAS YOUNG" + blinking "START"; FIRE starts the intro
 ;          INTRO - blue sky and field; clouds roll in, turn grey, lightning in the clouds,
 ;                  rain starts, two lightning strikes hit the ground
+;          (the song music/glafouk - miniblast.ttt starts with the intro)
 ;          MAIN  - three trees of height 2-4 (level 1: all 4).  Lightning strikes the
 ;                  tallest object, counted in blocks: the tallest tree trunk (canopy not
 ;                  counted), or the player's wood tower if it is at least as tall as every
@@ -91,8 +96,10 @@ TOWER_STRIKE_LOSS = 2           ; blocks burnt off the tower by a strike
 PILE_STRIKE_LOSS = 2            ; blocks burnt off a wood pile by a strike
 BOLT_MIN_X      = 19            ; the kernel's GRP1 write needs the bolt at x >= 19
 OVER_FREEZE     = 90            ; frames the final scene stays before the GAME OVER text
-TUNE_OVER       = 0             ; first Tune* entry of the GAME OVER jingle
-TUNE_ROUND      = 5             ; first Tune* entry of the ROUND jingle
+SONG_MAIN       = 0             ; songs in rainstorm_music.inc, in tools/ttt2asm.py order:
+SONG_OVER       = 1             ;   miniblast (intro + game), game over, round, silence
+SONG_ROUND      = 2
+SONG_NONE       = 3
 ROUND_SHOW      = 120           ; frames the ROUND n screen stays
 OVER_COLOR      = $44           ; red (GAME OVER); ROUND uses TITLE_COLOR
 TEXT_SCALE      = 8             ; text screen: lines per font row
@@ -108,6 +115,8 @@ PLANT_SPLIT_12  = 102           ;   below this slot 1, else slot 2
 CARRY_NONE      = 0
 CARRY_BLOCK     = 1
 CARRY_SEED      = 2
+BANK0           = $FFF8         ; F8 bank-switch hotspots: any access selects that bank
+BANK1           = $FFF9
 TARGET_TOWER    = 3
 TARGET_PILE     = 4             ; 4-6: wood pile at slot Target-4
 TARGET_PLAYER   = 7
@@ -118,13 +127,13 @@ TARGET_NONE     = $FF
         org $80
 State       ds 1
 Frame       ds 1
-FireDown    ds 1                ; $80 while the button is held
-FirePressed ds 1                ; $80 for one frame on a new press
+Fire        ds 1                ; bit 7: button held, bit 6: new press this frame
 StartColor  ds 1
-TuneIdx     = StartColor        ; text screens reuse it: next Tune* entry (StartColor is title-only)
+tt_timer    = StartColor        ; music row timer (StartColor is title-only; the title is silent)
 Rand        ds 1                ; 8-bit LFSR, never 0
 Tmp         ds 1
 Tmp2        ds 1
+tt_ptr      = Tmp               ; the player's pointer: it runs first in VBLANK, when Tmp/Tmp2 are free
 Row         ds 1                ; Rebuild: row base index
 Cnt         ds 1                ; Rebuild: rows left
 Obj         ds 1                ; Rebuild: tree slot
@@ -158,13 +167,23 @@ CountSec    ds 1                ; seconds left in the round, BCD (status line)
 JumpT       ds 1                ; 0 on the ground, else 1 + index into JumpTbl
 Carry       ds 1                ; CARRY_*
 Level       ds 1
-Goal        ds 1                ; tower height that completes the level
 NextStrike  ds 1
 Dirty       ds 1                ; bits 0-2: redraw tree slot, bit 3: redraw tower (one per frame)
 Rows        ds TREE_ROWS*6      ; per row: PF0L PF1L PF2L PF0R PF1R PF2R
 RowColor    ds TREE_ROWS
 StatusPF1   ds 5                ; status digits, top row first
 StatusPF2   ds 5
+        ; TIATracker player state (bank 0); tt_timer and tt_ptr are aliased above
+tt_cur_pat_index_c0  ds 1       ; sequence table index
+tt_cur_pat_index_c1  ds 1
+tt_cur_note_index_c0 ds 1       ; row within the pattern
+tt_cur_note_index_c1 ds 1
+tt_envelope_index_c0 ds 1
+tt_envelope_index_c1 ds 1
+tt_cur_ins_c0        ds 1       ; current note byte (0 = none yet)
+tt_cur_ins_c1        ds 1
+        ; what is left, $F8-$FF, is the stack: 4 levels of jsr.  tools/vcssim.py
+        ; prints the deepest use; TreeHeight inlines NextRand to stay within it.
 
 ;------------------------------------------------------------------------------
 ; SET_TIMER n -- start the RIOT timer for n*64 cycles.
@@ -233,12 +252,29 @@ StatusPF2   ds 5
         ENDM
 
 ;------------------------------------------------------------------------------
-        seg Code
-        org $F000
+        include "rainstorm_bank0.asm"   ; the music player and the songs (file offset 0)
 
-Reset   CLEAN_START
+;==============================================================================
+; BANK 1: the game
+;==============================================================================
+        seg Code
+        org $2000
+        rorg $F000
+        ; Bank-0 calls.  A stub switches banks in the middle of itself: the
+        ; instruction after sta BANK0 is fetched from bank 0, where the same
+        ; addresses hold jsr <routine> / sta BANK1, and the rts here follows.
+MusicPlay                       ; once per frame: play the current song (tt_Player)
+        sta BANK0
+        ds 6
+        rts
+MusicStart                      ; A = SONG_*: start that song from its first row (MusicInit)
+        sta BANK0
+        ds 6
+        rts
+Reset   sta BANK1               ; both banks' RESET vector: bank 0's copy of this
+        CLEAN_START             ; instruction brings a bank-0 power-up here
         lda #$80
-        sta FireDown            ; ignore a button already held at power-on
+        sta Fire                ; ignore a button already held at power-on
         lda #$A5
         sta Rand
         lda #1
@@ -252,6 +288,10 @@ MainLoop
         VERTICAL_SYNC
         SET_TIMER 43            ; 43*64 cycles ~= 37 lines of VBLANK
 
+        lda State
+        beq .quiet              ; the title is silent (TitleLogic mutes the channels)
+        jsr MusicPlay
+.quiet
         ;--- game logic (runs during VBLANK) ---
         inc Frame
         jsr ReadFire
@@ -293,18 +333,19 @@ Overscan
         jmp MainLoop
 
 ;------------------------------------------------------------------------------
-; Edge-detect the left joystick button (INPT4 bit 7 is 0 while pressed).
+; Edge-detect the left joystick button (INPT4 bit 7 is 0 while pressed):
+; Fire bit 7 = held now, bit 6 = up last frame and held now (test with bit/bvc).
         SUBROUTINE
 ReadFire
         lda INPT4
         and #$80
         eor #$80                ; $80 = held now
-        tay
-        lda FireDown
-        eor #$80                ; $80 = was up last frame
-        sty FireDown
-        and FireDown            ; $80 = up last frame and held now
-        sta FirePressed
+        bit Fire
+        bmi .store              ; held last frame too: no new press
+        cmp #$80
+        bne .store
+        ora #$40                ; new press
+.store  sta Fire
         rts
 
 ; 8-bit maximal-length LFSR
@@ -324,6 +365,8 @@ NextRand
 TitleLogic
         lda #0
         sta COLUBK
+        sta AUDV0               ; no music on the title (also after GAME OVER / console RESET)
+        sta AUDV1
         ldx #START_COLOR_ON     ; blink "START" every 16 frames
         lda Frame
         and #$10
@@ -331,8 +374,8 @@ TitleLogic
         ldx #START_COLOR_OFF
 .on     stx StartColor
 
-        lda FirePressed
-        beq .stay
+        bit Fire
+        bvc .stay
         jmp InitScene
 .stay   rts
 
@@ -449,7 +492,8 @@ InitScene
         jsr HideBolt            ; hides the player too
         lda #STATE_INTRO
         sta State
-        rts
+        lda #SONG_MAIN          ; the song plays from here through the game
+        jmp MusicStart
 
 ; Enter the main game (from the intro)
         SUBROUTINE
@@ -473,13 +517,6 @@ NewLevel
         sta TreeH,x
         dex
         bpl .slot
-        lda Level
-        clc
-        adc #4
-        cmp #TREE_ROWS+1
-        bcc .goalOk
-        lda #TREE_ROWS
-.goalOk sta Goal
         ; round clock: 30 s on level 1, 30 s more per level, max 99 (BCD)
         lda Level
         cmp #1
@@ -510,9 +547,8 @@ NewLevel
         sta State
         lda #1
         sta Phase               ; text phase (as in STATE_OVER)
-        sta Timer               ; jingle: next frame loads its first note
-        lda #TUNE_ROUND
-        sta TuneIdx
+        lda #SONG_ROUND
+        jsr MusicStart
         lda #ROUND_SHOW
         sta ShowTimer
 .first  rts
@@ -525,8 +561,11 @@ TreeHeight
         bne .random
         lda #4
         rts
-.random jsr NextRand
-        lda Rand
+.random lda Rand                ; NextRand, inlined: NewLevel is already 3 calls deep
+        lsr
+        bcc .noEor
+        eor #$B4
+.noEor  sta Rand
         and #3
         tay
         lda HeightTbl,y
@@ -858,72 +897,33 @@ MainLogic
 .done   rts
 
 ; Text screens.  STATE_OVER: Phase 0 = frozen scene for Timer frames, then
-; Phase 1 = GAME OVER text until FIRE (-> title).  STATE_ROUND: ROUND n text
-; for Timer frames, then the game resumes.
+; Phase 1 = GAME OVER text (with its song) until FIRE (-> title).  STATE_ROUND:
+; ROUND n text with its song for ShowTimer frames, then the game resumes.
         SUBROUTINE
 TextLogic
         lda Phase
         bne .text
         dec Timer
         bne .done
-        inc Phase               ; GAME OVER text: start its jingle
-        lda #1
-        sta Timer               ; next frame loads the first note
-        lda #TUNE_OVER
-        sta TuneIdx
-.done   rts
-        ; jingle: TuneIdx = next Tune* entry, Timer = frames left in the current note
-.text   dec Timer
-        bne .held
-        ldx TuneIdx
-        lda TuneLen,x           ; 0 = end of the tune
-        sta Timer
-        beq .hush
-        lda TuneF,x
-        sta AUDF0
-        lda TuneCV,x            ; AUDC in the high nibble, volume in the low
-        lsr
-        lsr
-        lsr
-        lsr
-        sta AUDC0
-        lda TuneCV,x
-        and #$0F
-        sta AUDV0
-        inc TuneIdx
-        bne .held               ; always
-.hush   sta AUDV0               ; A = 0: silence (the end entry just repeats)
-.held   lda State
+        inc Phase               ; GAME OVER text: start its song
+        lda #SONG_OVER
+        jmp MusicStart
+.text   lda State
         cmp #STATE_ROUND
         beq .round
-        lda FirePressed         ; GAME OVER: FIRE -> title
-        beq .done
-        lda #STATE_TITLE        ; = 0
+        bit Fire                ; GAME OVER: FIRE -> title (TitleLogic mutes the song)
+        bvc .done
+        lda #STATE_TITLE
         sta State
-        sta AUDV0               ; in case the tune is still playing
-        rts
+.done   rts
 .round  dec ShowTimer
         bne .done
         lda #STATE_MAIN
         sta State
         lda #60
         sta CountTick           ; Timer doubles as the clock's frame counter
-        rts
-
-; Jingles, hand-converted from the TIATracker songs in music/ (see README, Music).
-; One entry per note: AUDF, AUDC<<4 | volume, frames; frames 0 ends the tune.
-; Both songs use one "pure combined" instrument (notes >= 32: AUDC 12, AUDF = note-32,
-; below 32: AUDC 4, AUDF = note) plus the instrument's frequency offset, held at its
-; sustain volume; global speed 5 = 5 frames per row; no goto, so each plays once.
-;   TUNE_OVER  "game over - first revision.ttt": notes 51 52 55 58, offset +3, vol 15
-;   TUNE_ROUND "second round.ttt": 63 61 58 55 52 51 49 47 then 3 held 8 rows,
-;              offset -8 (3-8 wraps to AUDF 27 on AUDC 4, as TIATracker plays it), vol 5
-TuneF       .byte 22,23,26,29,0
-            .byte 23,21,18,15,12,11,9,7,27,0
-TuneCV      .byte $CF,$CF,$CF,$CF,0
-            .byte $C5,$C5,$C5,$C5,$C5,$C5,$C5,$C5,$45,0
-TuneLen     .byte 10,10,10,50,0
-            .byte 5,5,5,5,5,5,5,5,40,0
+        lda #SONG_MAIN
+        jmp MusicStart
 
 ; The round number as one big digit: 5 glyph rows of 8 lines, centred
 ; (PF2 left, bits 2-4, like the old goal digit).  DIGIT_LINES lines.
@@ -1031,7 +1031,8 @@ StrikeEffect
         sta Phase
         lda #OVER_FREEZE
         sta Timer
-        rts
+        lda #SONG_NONE          ; silence while the scene is frozen
+        jmp MusicStart
 
 ;------------------------------------------------------------------------------
         SUBROUTINE
@@ -1091,8 +1092,8 @@ PlayerLogic
         lda Facing
         sta REFP0
 
-        lda FirePressed
-        beq .noFire
+        bit Fire
+        bvc .noFire
         lda Carry
         cmp #CARRY_BLOCK
         beq .haveBlock
@@ -1130,9 +1131,14 @@ PlayerLogic
         lda Dirty
         ora #8
         sta Dirty
-        lda TowerH
-        cmp Goal
-        bcc .noFire
+        lda Level               ; goal = 4 + level, at most TREE_ROWS
+        clc
+        adc #3                  ; (goal - 1 >= TowerH: not there yet)
+        cmp #TREE_ROWS
+        bcc .goal
+        lda #TREE_ROWS-1
+.goal   cmp TowerH
+        bcs .noFire
         inc Level
         jmp NewLevel
 .haveSeed
@@ -1663,8 +1669,11 @@ PlayerLo    .byte <(PlayerStandNone-PLAYER_Y0),<(PlayerWalkNone-PLAYER_Y0)
             .byte <(PlayerStandBlock-PLAYER_Y0),<(PlayerWalkBlock-PLAYER_Y0)
             .byte <(PlayerStandSeed-PLAYER_Y0),<(PlayerWalkSeed-PLAYER_Y0)
 
-        echo "ROM bytes free:", ($FFFC - *)d
+        echo "Bank 1 bytes free:", ($FFF8 - *)d   ; $FFF8/9 are the hotspots: keep them clear
 
-        org $FFFC
+        rend
+        org $2FFC
+        rorg $FFFC
         .word Reset
         .word Reset
+        rend

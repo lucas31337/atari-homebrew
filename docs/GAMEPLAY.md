@@ -18,6 +18,7 @@ When all the trees are gone you will have a seed. To plant the seed press the fi
 
 ### Rules (as implemented)
 
+- **Music.** Pressing START on the title starts the song (music/glafouk - miniblast.ttt, Glafouk's "Miniblast"), which loops through the intro and the whole game. The bolt hitting the player cuts it off; the ROUND and GAME OVER screens play their own tunes; the title screen is silent.
 - **Lightning target.** Heights are counted in blocks: a tree counts its trunk blocks (the canopy does not count), a wood pile counts its logs, the tower counts its blocks, and the player counts 2 (3 from 6 lines up in a jump, 4 at the top). The tallest object is struck. Ties go to the tower first, then the leftmost tree, then the leftmost pile; the player loses every tie. So on level 1 (trees of 4) the tower is hit as soon as it reaches 4 blocks, and once the trees are gone the piles start burning unless a new tree is planted to draw the lightning.
 - **Struck tree** becomes a pile of that many wood blocks at its base (a pile holds at most 8). **Struck tower** loses 2 blocks. **Struck pile** loses 2 logs.
 - **Strike interval** by level (frames): 240, 210, 180, 150, 120, 90, 90, 90.
