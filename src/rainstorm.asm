@@ -91,6 +91,8 @@ TOWER_STRIKE_LOSS = 2           ; blocks burnt off the tower by a strike
 PILE_STRIKE_LOSS = 2            ; blocks burnt off a wood pile by a strike
 BOLT_MIN_X      = 19            ; the kernel's GRP1 write needs the bolt at x >= 19
 OVER_FREEZE     = 90            ; frames the final scene stays before the GAME OVER text
+TUNE_OVER       = 0             ; first Tune* entry of the GAME OVER jingle
+TUNE_ROUND      = 5             ; first Tune* entry of the ROUND jingle
 ROUND_SHOW      = 120           ; frames the ROUND n screen stays
 OVER_COLOR      = $44           ; red (GAME OVER); ROUND uses TITLE_COLOR
 TEXT_SCALE      = 8             ; text screen: lines per font row
@@ -119,6 +121,7 @@ Frame       ds 1
 FireDown    ds 1                ; $80 while the button is held
 FirePressed ds 1                ; $80 for one frame on a new press
 StartColor  ds 1
+TuneIdx     = StartColor        ; text screens reuse it: next Tune* entry (StartColor is title-only)
 Rand        ds 1                ; 8-bit LFSR, never 0
 Tmp         ds 1
 Tmp2        ds 1
@@ -139,6 +142,7 @@ RainBase    ds 1                ; 0 = no rain, RAIN_ON = rain
 RainScroll  ds 1
 RainIdx     ds 1                ; kernel start index into the rain tables
 FlashTimer  ds 1
+ShowTimer   = FlashTimer        ; STATE_ROUND reuses it: frames the screen stays (no flash runs then)
 BoltTimer   ds 1
 BoltX       ds 1
 BoltPtr     ds 2                ; bolt graphics for the sky band (or Zeros)
@@ -194,31 +198,6 @@ StatusPF2   ds 5
         jsr DrawTextLo
         ENDM
 
-;------------------------------------------------------------------------------
-; CLOUD_ROW r -- one cloud row, CLOUD_LINES lines, X = scroll offset
-        MAC CLOUD_ROW
-        ldy #CLOUD_LINES
-.line   sta WSYNC
-        lda Cloud{1}_PF0L,x     ; 4
-        sta PF0                 ; 7
-        lda Cloud{1}_PF1L,x     ; 11
-        sta PF1                 ; 14
-        lda Cloud{1}_PF2L,x     ; 18
-        sta PF2                 ; 21
-        lda Cloud{1}_PF0R,x     ; 25
-        nop                     ; 27
-        sta PF0                 ; 30
-        lda Cloud{1}_PF1R,x     ; 34
-        nop                     ; 36
-        nop                     ; 38
-        sta PF1                 ; 41
-        lda Cloud{1}_PF2R,x     ; 45
-        nop                     ; 47
-        nop                     ; 49
-        sta PF2                 ; 52
-        dey                     ; 54
-        bne .line               ; 57
-        ENDM
 
 ;------------------------------------------------------------------------------
 ; TREE_ROW row, player -- one tree-band row (BLOCK_LINES lines) from RAM with
@@ -531,8 +510,11 @@ NewLevel
         sta State
         lda #1
         sta Phase               ; text phase (as in STATE_OVER)
+        sta Timer               ; jingle: next frame loads its first note
+        lda #TUNE_ROUND
+        sta TuneIdx
         lda #ROUND_SHOW
-        sta Timer
+        sta ShowTimer
 .first  rts
 
 ; A = height for a new tree (4 on level 1, else 2..4), preserves X
@@ -884,23 +866,64 @@ TextLogic
         bne .text
         dec Timer
         bne .done
-        inc Phase
+        inc Phase               ; GAME OVER text: start its jingle
+        lda #1
+        sta Timer               ; next frame loads the first note
+        lda #TUNE_OVER
+        sta TuneIdx
 .done   rts
-.text   lda State
+        ; jingle: TuneIdx = next Tune* entry, Timer = frames left in the current note
+.text   dec Timer
+        bne .held
+        ldx TuneIdx
+        lda TuneLen,x           ; 0 = end of the tune
+        sta Timer
+        beq .hush
+        lda TuneF,x
+        sta AUDF0
+        lda TuneCV,x            ; AUDC in the high nibble, volume in the low
+        lsr
+        lsr
+        lsr
+        lsr
+        sta AUDC0
+        lda TuneCV,x
+        and #$0F
+        sta AUDV0
+        inc TuneIdx
+        bne .held               ; always
+.hush   sta AUDV0               ; A = 0: silence (the end entry just repeats)
+.held   lda State
         cmp #STATE_ROUND
         beq .round
-        lda FirePressed
+        lda FirePressed         ; GAME OVER: FIRE -> title
         beq .done
-        lda #STATE_TITLE
+        lda #STATE_TITLE        ; = 0
         sta State
+        sta AUDV0               ; in case the tune is still playing
         rts
-.round  dec Timer
+.round  dec ShowTimer
         bne .done
         lda #STATE_MAIN
         sta State
         lda #60
         sta CountTick           ; Timer doubles as the clock's frame counter
         rts
+
+; Jingles, hand-converted from the TIATracker songs in music/ (see README, Music).
+; One entry per note: AUDF, AUDC<<4 | volume, frames; frames 0 ends the tune.
+; Both songs use one "pure combined" instrument (notes >= 32: AUDC 12, AUDF = note-32,
+; below 32: AUDC 4, AUDF = note) plus the instrument's frequency offset, held at its
+; sustain volume; global speed 5 = 5 frames per row; no goto, so each plays once.
+;   TUNE_OVER  "game over - first revision.ttt": notes 51 52 55 58, offset +3, vol 15
+;   TUNE_ROUND "second round.ttt": 63 61 58 55 52 51 49 47 then 3 held 8 rows,
+;              offset -8 (3-8 wraps to AUDF 27 on AUDC 4, as TIATracker plays it), vol 5
+TuneF       .byte 22,23,26,29,0
+            .byte 23,21,18,15,12,11,9,7,27,0
+TuneCV      .byte $CF,$CF,$CF,$CF,0
+            .byte $C5,$C5,$C5,$C5,$C5,$C5,$C5,$C5,$45,0
+TuneLen     .byte 10,10,10,50,0
+            .byte 5,5,5,5,5,5,5,5,40,0
 
 ; The round number as one big digit: 5 glyph rows of 8 lines, centred
 ; (PF2 left, bits 2-4, like the old goal digit).  DIGIT_LINES lines.
@@ -1420,11 +1443,40 @@ SceneDraw
         sta PF1
         sta PF2
 
-        ldx CloudOffset
-        CLOUD_ROW 0
-        CLOUD_ROW 1
-        CLOUD_ROW 2
-        CLOUD_ROW 3
+        ; 4 cloud rows of CLOUD_LINES lines; the tables are indexed offset*4 + row,
+        ; so one loop draws all rows and the row change is cheap (abs,X page crossings
+        ; only shift the writes by a cycle each, within their windows)
+        lda CloudOffset
+        asl
+        asl
+        tax
+        clc
+        adc #4
+        sta Tmp                 ; end index
+.crow   ldy #CLOUD_LINES
+.cline  sta WSYNC
+        lda Cloud_PF0L,x        ; 4
+        sta PF0                 ; 7
+        lda Cloud_PF1L,x        ; 11
+        sta PF1                 ; 14
+        lda Cloud_PF2L,x        ; 18
+        sta PF2                 ; 21
+        lda Cloud_PF0R,x        ; 25
+        nop                     ; 27
+        sta PF0                 ; 30  right PF0 (28..49)
+        lda Cloud_PF1R,x        ; 34
+        nop                     ; 36
+        nop                     ; 38
+        sta PF1                 ; 41  right PF1 (39..54)
+        lda Cloud_PF2R,x        ; 45
+        nop                     ; 47
+        nop                     ; 49
+        sta PF2                 ; 52  right PF2 (50..65)
+        dey                     ; 54
+        bne .cline              ; 57
+        inx                     ; 58  next row
+        cpx Tmp                 ; 61
+        bne .crow               ; 64  (ldy 66, WSYNC written by 69)
 
         ; transition line: rain colour, playfield cleared
         sta WSYNC

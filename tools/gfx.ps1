@@ -1,6 +1,6 @@
 # Usage: .\tools\gfx.ps1 [src\rainstorm_gfx.inc]
 # Generates the scene graphics tables for rainstorm.asm:
-#   Cloud<r>_<reg>  21-entry playfield scroll tables (offset 0 = clear sky, 20 = clouds fully in), 4 rows
+#   Cloud_<reg>     84-entry playfield scroll tables, index = offset*4 + row (offset 0 = clear sky, 20 = fully in)
 #   RainPF0/1/2     32 entries: 0-15 blank, 16-31 a 20-pixel rain tile (repeats vertically)
 #   Trunk/Wide/Narrow/Pile <Reg|Byte>  playfield (register, byte) patterns per tree slot
 #   TOWER_REG/BYTE  the wood tower at the right edge
@@ -64,15 +64,15 @@ $cloudArt = @(
 )
 $regs = 'PF0L', 'PF1L', 'PF2L', 'PF0R', 'PF1R', 'PF2R'
 $script:files.main += "; clouds"; Art $cloudArt
+$tables = @{}; foreach ($g in $regs) { $tables[$g] = @(0) * 84 }
 for ($r = 0; $r -lt 4; $r++) {
     $src = ('.' * 40) + $cloudArt[$r]
-    $tables = @{}; foreach ($g in $regs) { $tables[$g] = @() }
     for ($o = 0; $o -le 20; $o++) {              # 21 offsets, 2 columns per step
         $b = PFBytes $src.Substring(2 * $o, 40)  # window slides right: art enters from the right edge
-        for ($k = 0; $k -lt 6; $k++) { $tables[$regs[$k]] += $b[$k] }
+        for ($k = 0; $k -lt 6; $k++) { $tables[$regs[$k]][$o * 4 + $r] = $b[$k] }
     }
-    foreach ($g in $regs) { Emit "Cloud${r}_$g" $tables[$g] }
 }
+foreach ($g in $regs) { Emit "Cloud_$g" $tables[$g] }   # index = offset*4 + row: one kernel loop draws the 4 rows
 $script:files.main += ""
 
 #--- rain: 16-row, 20-pixel tile of short streaks (repeat mode shows it twice) ---
